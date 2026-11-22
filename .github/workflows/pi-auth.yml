@@ -34,9 +34,15 @@ jobs:
       TARGET_REPOSITORY: ${{ inputs.repository }}
       ISSUE_NUMBER: ${{ inputs.issue_number }}
       COMMENT_ID: ${{ inputs.comment_id }}
-      PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-auth
 
     steps:
+      - name: Configure Pi auth directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "PI_CODING_AGENT_DIR=$RUNNER_TEMP/pi-auth" >> "$GITHUB_ENV"
+
       - name: Validate input shape
         shell: bash
         run: |
@@ -82,26 +88,89 @@ jobs:
               "repos/$ORG/$TARGET_REPOSITORY/issues/comments/$COMMENT_ID"
           )"
 
+          fields="$(
+            gh api \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER/issue-field-values"
+          )"
+
+          # The authorization subject must still be an open Implementation Issue.
           jq -e '
             .state == "open"
             and ((.pull_request // null) == null)
             and ((.type.name // "") == "Implementation")
           ' <<<"$issue" >/dev/null
 
-          expected_issue_url="https://api.github.com/repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER"
+          field_value() {
+            jq -er \
+              --arg name "$1" '
+                [
+                  .[]
+                  | select(.issue_field_name == $name)
+                  | .single_select_option.name
+                ]
+                | if length == 0 then
+                    ""
+                  elif length == 1 then
+                    .[0]
+                  else
+                    error("duplicate Issue field")
+                  end
+              ' <<<"$fields"
+          }
 
+          publication="$(field_value "Publication")"
+          scope="$(field_value "Scope")"
+          proof="$(field_value "Proof")"
+
+          case "$publication" in
+            "Direct"|"Pull request")
+              ;;
+            *)
+              echo "::error::Publication must be Direct or Pull request."
+              exit 1
+              ;;
+          esac
+
+          case "$scope" in
+            ""|"Frontend")
+              ;;
+            *)
+              echo "::error::Scope must be blank or Frontend."
+              exit 1
+              ;;
+          esac
+
+          case "$proof" in
+            ""|"Screenshot")
+              ;;
+            *)
+              echo "::error::Proof must be blank or Screenshot."
+              exit 1
+              ;;
+          esac
+
+          # The supplied comment must belong to this Issue.
+          expected_issue_url="https://api.github.com/repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER"
           actual_issue_url="$(jq -r '.issue_url' <<<"$comment")"
+
+          [[ "$actual_issue_url" == "$expected_issue_url" ]]
+
           author="$(jq -r '.user.login' <<<"$comment")"
           author_type="$(jq -r '.user.type' <<<"$comment")"
           body="$(jq -r '.body // ""' <<<"$comment")"
 
-          [[ "$actual_issue_url" == "$expected_issue_url" ]]
+          # Automation and bots cannot manufacture implementation authority.
           [[ "$author_type" == "User" ]]
 
           printf '%s' "$body" |
             grep -Eiq '(^|[^[:alnum:]_])@pi([^[:alnum:]_]|$)'
 
-          author_lower="$(printf '%s' "$author" | tr '[:upper:]' '[:lower:]')"
+          author_lower="$(
+            printf '%s' "$author" |
+              tr '[:upper:]' '[:lower:]'
+          )"
+
           allowed="$(
             printf '%s' "$AUTHORIZED_USERS" |
               tr '[:upper:]' '[:lower:]' |
@@ -109,35 +178,40 @@ jobs:
           )"
 
           case ",$allowed," in
-            *",$author_lower,"*) ;;
+            *",$author_lower,"*)
+              ;;
             *)
               echo "::error::@$author is not authorized to delegate Pi execution."
               exit 1
               ;;
           esac
 
+          # A retry of the same central request must not create another execution
+          # handoff for the same human authorization comment.
           marker="<!-- nyonya-pi:authorization:$COMMENT_ID -->"
 
           existing="$(
             gh api --paginate \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
               "repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER/comments" |
               jq -r \
                 --arg bot "$BOT_LOGIN" \
-                --arg marker "$marker" \
-                '.[] |
-                 select(
-                   .user.login == $bot
-                   and ((.body // "") | contains($marker))
-                 ) |
-                 .id' |
+                --arg marker "$marker" '
+                  .[]
+                  | select(
+                      .user.login == $bot
+                      and ((.body // "") | contains($marker))
+                    )
+                  | .id
+                ' |
               head -n 1
           )"
 
           if [[ -n "$existing" ]]; then
-            echo "Authorization comment has already produced an execution handoff."
-            echo "skip=true" >>"$GITHUB_OUTPUT"
+            echo "Authorization comment already produced an execution handoff."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "skip=false" >>"$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Node.js
@@ -148,7 +222,10 @@ jobs:
 
       - name: Install Pi
         if: steps.request.outputs.skip != 'true'
+        shell: bash
         run: |
+          set -euo pipefail
+
           npm install -g --ignore-scripts \
             @earendil-works/pi-coding-agent@1.6.0
 
@@ -160,14 +237,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          [[ -n "$PI_AUTH_JSON" ]]
+          if [[ -z "$PI_AUTH_JSON" ]]; then
+            echo "::error::PI_AUTH is empty or unavailable."
+            exit 1
+          fi
 
           install -d -m 700 "$PI_CODING_AGENT_DIR"
-          printf '%s' "$PI_AUTH_JSON" > "$PI_CODING_AGENT_DIR/auth.json"
+
+          printf '%s' "$PI_AUTH_JSON" \
+            > "$PI_CODING_AGENT_DIR/auth.json"
+
           chmod 600 "$PI_CODING_AGENT_DIR/auth.json"
 
-          jq -e '.openai.type == "oauth"' \
-            "$PI_CODING_AGENT_DIR/auth.json" >/dev/null
+          jq -e '
+            .openai.type == "oauth"
+            and (.openai.access | type == "string")
+            and (.openai.refresh | type == "string")
+            and (.openai.expires | type == "number")
+          ' "$PI_CODING_AGENT_DIR/auth.json" >/dev/null
 
           cp \
             "$PI_CODING_AGENT_DIR/auth.json" \
@@ -185,9 +272,16 @@ jobs:
               --min-expiry 50m
           )"
 
+          if [[ -z "$token" ]]; then
+            echo "::error::Pi returned an empty ChatGPT bearer token."
+            exit 1
+          fi
+
           echo "::add-mask::$token"
 
-          printf '%s' "$token" > "$RUNNER_TEMP/pi-chatgpt-token"
+          printf '%s' "$token" \
+            > "$RUNNER_TEMP/pi-chatgpt-token"
+
           chmod 600 "$RUNNER_TEMP/pi-chatgpt-token"
 
       - name: Persist rotated PI_AUTH
@@ -202,10 +296,14 @@ jobs:
             "$PI_CODING_AGENT_DIR/auth.before.json" \
             "$PI_CODING_AGENT_DIR/auth.json"
           then
+            echo "Pi rotated renewable ChatGPT authentication state."
+
             gh secret set PI_AUTH \
               --repo MalayaScientific/.github \
               --env pi-auth \
               < "$PI_CODING_AGENT_DIR/auth.json"
+          else
+            echo "PI_AUTH did not rotate."
           fi
 
       - name: Publish repository ChatGPT credential
@@ -230,6 +328,7 @@ jobs:
 
           comment="$(
             gh api \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
               "repos/$ORG/$TARGET_REPOSITORY/issues/comments/$COMMENT_ID"
           )"
 
@@ -254,6 +353,7 @@ jobs:
 
           gh api \
             --method POST \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
             "repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
             -f body="$handoff"
 
@@ -261,5 +361,10 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -rf "$PI_CODING_AGENT_DIR"
+          set +e
+
+          if [[ -n "${PI_CODING_AGENT_DIR:-}" ]]; then
+            rm -rf "$PI_CODING_AGENT_DIR"
+          fi
+
           rm -f "$RUNNER_TEMP/pi-chatgpt-token"
