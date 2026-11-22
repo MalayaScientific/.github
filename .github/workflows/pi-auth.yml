@@ -11,8 +11,8 @@ on:
         description: Implementation Issue number
         required: true
         type: string
-      comment_id:
-        description: Human @pi authorization comment ID
+      authorization_actor:
+        description: Human who applied ready-for-implementation
         required: true
         type: string
 
@@ -33,7 +33,8 @@ jobs:
       ORG: MalayaScientific
       TARGET_REPOSITORY: ${{ inputs.repository }}
       ISSUE_NUMBER: ${{ inputs.issue_number }}
-      COMMENT_ID: ${{ inputs.comment_id }}
+      AUTHORIZATION_ACTOR: ${{ inputs.authorization_actor }}
+      EXECUTION_ENVIRONMENT: pi-execution
 
     steps:
       - name: Configure Pi auth directory
@@ -50,7 +51,34 @@ jobs:
 
           [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9._-]+$ ]]
           [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]
-          [[ "$COMMENT_ID" =~ ^[0-9]+$ ]]
+          [[ "$AUTHORIZATION_ACTOR" =~ ^[A-Za-z0-9-]+$ ]]
+
+      - name: Validate authorization actor
+        shell: bash
+        env:
+          AUTHORIZED_USERS: ${{ vars.PI_AUTHORIZED_GITHUB_LOGINS }}
+        run: |
+          set -euo pipefail
+
+          actor="$(
+            printf '%s' "$AUTHORIZATION_ACTOR" |
+              tr '[:upper:]' '[:lower:]'
+          )"
+
+          allowed="$(
+            printf '%s' "$AUTHORIZED_USERS" |
+              tr '[:upper:]' '[:lower:]' |
+              tr -d '[:space:]'
+          )"
+
+          case ",$allowed," in
+            *",$actor,"*)
+              ;;
+            *)
+              echo "::error::@$AUTHORIZATION_ACTOR is not authorized to delegate Pi execution."
+              exit 1
+              ;;
+          esac
 
       - name: Mint Nyonya Pi control token
         id: control
@@ -63,16 +91,24 @@ jobs:
             .github
             ${{ inputs.repository }}
           permission-environments: write
-          permission-issues: write
-          permission-secrets: write
+          permission-issues: read
 
-      - name: Validate human authorization
-        id: request
+      - name: Validate target execution environment
         shell: bash
         env:
           GH_TOKEN: ${{ steps.control.outputs.token }}
-          AUTHORIZED_USERS: ${{ vars.PI_AUTHORIZED_GITHUB_LOGINS }}
-          BOT_LOGIN: ${{ vars.NYONYA_PI_BOT_LOGIN }}
+        run: |
+          set -euo pipefail
+
+          gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$ORG/$TARGET_REPOSITORY/environments/$EXECUTION_ENVIRONMENT" \
+            >/dev/null
+
+      - name: Validate implementation authorization
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.control.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -82,23 +118,29 @@ jobs:
               "repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER"
           )"
 
-          comment="$(
-            gh api \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$ORG/$TARGET_REPOSITORY/issues/comments/$COMMENT_ID"
-          )"
-
           fields="$(
             gh api \
               -H "X-GitHub-Api-Version: 2026-03-10" \
               "repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER/issue-field-values"
           )"
 
-          # The authorization subject must still be an open Implementation Issue.
+          # Must still be an open Implementation Issue.
           jq -e '
             .state == "open"
             and ((.pull_request // null) == null)
             and ((.type.name // "") == "Implementation")
+          ' <<<"$issue" >/dev/null
+
+          # Request auth has already claimed the one-shot command.
+          jq -e '
+            [.labels[]?.name]
+            | index("ready-for-implementation") == null
+          ' <<<"$issue" >/dev/null
+
+          # Human escalation blocks execution until explicitly resolved.
+          jq -e '
+            [.labels[]?.name]
+            | index("require-human") == null
           ' <<<"$issue" >/dev/null
 
           field_value() {
@@ -119,9 +161,15 @@ jobs:
               ' <<<"$fields"
           }
 
+          execution="$(field_value "Execution")"
           publication="$(field_value "Publication")"
           scope="$(field_value "Scope")"
           proof="$(field_value "Proof")"
+
+          if [[ "$execution" != "Requesting auth" ]]; then
+            echo "::error::Execution must be Requesting auth before credential issuance."
+            exit 1
+          fi
 
           case "$publication" in
             "Direct"|"Pull request")
@@ -150,78 +198,12 @@ jobs:
               ;;
           esac
 
-          # The supplied comment must belong to this Issue.
-          expected_issue_url="https://api.github.com/repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER"
-          actual_issue_url="$(jq -r '.issue_url' <<<"$comment")"
-
-          [[ "$actual_issue_url" == "$expected_issue_url" ]]
-
-          author="$(jq -r '.user.login' <<<"$comment")"
-          author_type="$(jq -r '.user.type' <<<"$comment")"
-          body="$(jq -r '.body // ""' <<<"$comment")"
-
-          # Automation and bots cannot manufacture implementation authority.
-          [[ "$author_type" == "User" ]]
-
-          printf '%s' "$body" |
-            grep -Eiq '(^|[^[:alnum:]_])@pi([^[:alnum:]_]|$)'
-
-          author_lower="$(
-            printf '%s' "$author" |
-              tr '[:upper:]' '[:lower:]'
-          )"
-
-          allowed="$(
-            printf '%s' "$AUTHORIZED_USERS" |
-              tr '[:upper:]' '[:lower:]' |
-              tr -d '[:space:]'
-          )"
-
-          case ",$allowed," in
-            *",$author_lower,"*)
-              ;;
-            *)
-              echo "::error::@$author is not authorized to delegate Pi execution."
-              exit 1
-              ;;
-          esac
-
-          # A retry of the same central request must not create another execution
-          # handoff for the same human authorization comment.
-          marker="<!-- nyonya-pi:authorization:$COMMENT_ID -->"
-
-          existing="$(
-            gh api --paginate \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER/comments" |
-              jq -r \
-                --arg bot "$BOT_LOGIN" \
-                --arg marker "$marker" '
-                  .[]
-                  | select(
-                      .user.login == $bot
-                      and ((.body // "") | contains($marker))
-                    )
-                  | .id
-                ' |
-              head -n 1
-          )"
-
-          if [[ -n "$existing" ]]; then
-            echo "Authorization comment already produced an execution handoff."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Set up Node.js
-        if: steps.request.outputs.skip != 'true'
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.22.2
 
       - name: Install Pi
-        if: steps.request.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -230,7 +212,6 @@ jobs:
             @earendil-works/pi-coding-agent@1.6.0
 
       - name: Hydrate renewable Pi auth
-        if: steps.request.outputs.skip != 'true'
         shell: bash
         env:
           PI_AUTH_JSON: ${{ secrets.PI_AUTH }}
@@ -261,7 +242,6 @@ jobs:
             "$PI_CODING_AGENT_DIR/auth.before.json"
 
       - name: Resolve fresh ChatGPT execution token
-        if: steps.request.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -285,7 +265,6 @@ jobs:
           chmod 600 "$RUNNER_TEMP/pi-chatgpt-token"
 
       - name: Persist rotated PI_AUTH
-        if: steps.request.outputs.skip != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ steps.control.outputs.token }}
@@ -306,8 +285,7 @@ jobs:
             echo "PI_AUTH did not rotate."
           fi
 
-      - name: Publish repository ChatGPT credential
-        if: steps.request.outputs.skip != 'true'
+      - name: Publish ChatGPT execution credential
         shell: bash
         env:
           GH_TOKEN: ${{ steps.control.outputs.token }}
@@ -316,46 +294,8 @@ jobs:
 
           gh secret set PI_CHATGPT_ACCESS_TOKEN \
             --repo "$ORG/$TARGET_REPOSITORY" \
+            --env "$EXECUTION_ENVIRONMENT" \
             < "$RUNNER_TEMP/pi-chatgpt-token"
-
-      - name: Emit execution handoff
-        if: steps.request.outputs.skip != 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ steps.control.outputs.token }}
-        run: |
-          set -euo pipefail
-
-          comment="$(
-            gh api \
-              -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$ORG/$TARGET_REPOSITORY/issues/comments/$COMMENT_ID"
-          )"
-
-          author="$(jq -r '.user.login' <<<"$comment")"
-          url="$(jq -r '.html_url' <<<"$comment")"
-          body="$(jq -r '.body // ""' <<<"$comment")"
-
-          marker="<!-- nyonya-pi:authorization:$COMMENT_ID -->"
-
-          quoted="$(
-            printf '%s\n' "$body" |
-              sed 's/^/> /'
-          )"
-
-          handoff="$(
-            printf '%s\n@nyonya-pi\n\nAuthorized by @%s: %s\n\n%s\n' \
-              "$marker" \
-              "$author" \
-              "$url" \
-              "$quoted"
-          )"
-
-          gh api \
-            --method POST \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            "repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
-            -f body="$handoff"
 
       - name: Remove local credentials
         if: always()
