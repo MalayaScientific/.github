@@ -1,0 +1,265 @@
+name: Pi Auth
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Target Malaya Scientific repository
+        required: true
+        type: string
+      issue_number:
+        description: Implementation Issue number
+        required: true
+        type: string
+      comment_id:
+        description: Human @pi authorization comment ID
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: pi-chatgpt-auth
+  queue: max
+
+jobs:
+  authorize:
+    name: Authorize Pi execution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: pi-auth
+
+    env:
+      ORG: MalayaScientific
+      TARGET_REPOSITORY: ${{ inputs.repository }}
+      ISSUE_NUMBER: ${{ inputs.issue_number }}
+      COMMENT_ID: ${{ inputs.comment_id }}
+      PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-auth
+
+    steps:
+      - name: Validate input shape
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]
+          [[ "$COMMENT_ID" =~ ^[0-9]+$ ]]
+
+      - name: Mint Nyonya Pi control token
+        id: control
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.NYONYA_PI_CLIENT_ID }}
+          private-key: ${{ secrets.NYONYA_PI_PRIVATE_KEY }}
+          owner: MalayaScientific
+          repositories: |
+            .github
+            ${{ inputs.repository }}
+          permission-environments: write
+          permission-issues: write
+          permission-secrets: write
+
+      - name: Validate human authorization
+        id: request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.control.outputs.token }}
+          AUTHORIZED_USERS: ${{ vars.PI_AUTHORIZED_GITHUB_LOGINS }}
+          BOT_LOGIN: ${{ vars.NYONYA_PI_BOT_LOGIN }}
+        run: |
+          set -euo pipefail
+
+          issue="$(
+            gh api \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER"
+          )"
+
+          comment="$(
+            gh api \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$ORG/$TARGET_REPOSITORY/issues/comments/$COMMENT_ID"
+          )"
+
+          jq -e '
+            .state == "open"
+            and ((.pull_request // null) == null)
+            and ((.type.name // "") == "Implementation")
+          ' <<<"$issue" >/dev/null
+
+          expected_issue_url="https://api.github.com/repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER"
+
+          actual_issue_url="$(jq -r '.issue_url' <<<"$comment")"
+          author="$(jq -r '.user.login' <<<"$comment")"
+          author_type="$(jq -r '.user.type' <<<"$comment")"
+          body="$(jq -r '.body // ""' <<<"$comment")"
+
+          [[ "$actual_issue_url" == "$expected_issue_url" ]]
+          [[ "$author_type" == "User" ]]
+
+          printf '%s' "$body" |
+            grep -Eiq '(^|[^[:alnum:]_])@pi([^[:alnum:]_]|$)'
+
+          author_lower="$(printf '%s' "$author" | tr '[:upper:]' '[:lower:]')"
+          allowed="$(
+            printf '%s' "$AUTHORIZED_USERS" |
+              tr '[:upper:]' '[:lower:]' |
+              tr -d '[:space:]'
+          )"
+
+          case ",$allowed," in
+            *",$author_lower,"*) ;;
+            *)
+              echo "::error::@$author is not authorized to delegate Pi execution."
+              exit 1
+              ;;
+          esac
+
+          marker="<!-- nyonya-pi:authorization:$COMMENT_ID -->"
+
+          existing="$(
+            gh api --paginate \
+              "repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER/comments" |
+              jq -r \
+                --arg bot "$BOT_LOGIN" \
+                --arg marker "$marker" \
+                '.[] |
+                 select(
+                   .user.login == $bot
+                   and ((.body // "") | contains($marker))
+                 ) |
+                 .id' |
+              head -n 1
+          )"
+
+          if [[ -n "$existing" ]]; then
+            echo "Authorization comment has already produced an execution handoff."
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js
+        if: steps.request.outputs.skip != 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.22.2
+
+      - name: Install Pi
+        if: steps.request.outputs.skip != 'true'
+        run: |
+          npm install -g --ignore-scripts \
+            @earendil-works/pi-coding-agent@1.6.0
+
+      - name: Hydrate renewable Pi auth
+        if: steps.request.outputs.skip != 'true'
+        shell: bash
+        env:
+          PI_AUTH_JSON: ${{ secrets.PI_AUTH }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$PI_AUTH_JSON" ]]
+
+          install -d -m 700 "$PI_CODING_AGENT_DIR"
+          printf '%s' "$PI_AUTH_JSON" > "$PI_CODING_AGENT_DIR/auth.json"
+          chmod 600 "$PI_CODING_AGENT_DIR/auth.json"
+
+          jq -e '.openai.type == "oauth"' \
+            "$PI_CODING_AGENT_DIR/auth.json" >/dev/null
+
+          cp \
+            "$PI_CODING_AGENT_DIR/auth.json" \
+            "$PI_CODING_AGENT_DIR/auth.before.json"
+
+      - name: Resolve fresh ChatGPT execution token
+        if: steps.request.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          token="$(
+            pi auth print-bearer-token \
+              --provider openai \
+              --min-expiry 50m
+          )"
+
+          echo "::add-mask::$token"
+
+          printf '%s' "$token" > "$RUNNER_TEMP/pi-chatgpt-token"
+          chmod 600 "$RUNNER_TEMP/pi-chatgpt-token"
+
+      - name: Persist rotated PI_AUTH
+        if: steps.request.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.control.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          if ! cmp -s \
+            "$PI_CODING_AGENT_DIR/auth.before.json" \
+            "$PI_CODING_AGENT_DIR/auth.json"
+          then
+            gh secret set PI_AUTH \
+              --repo MalayaScientific/.github \
+              --env pi-auth \
+              < "$PI_CODING_AGENT_DIR/auth.json"
+          fi
+
+      - name: Publish repository ChatGPT credential
+        if: steps.request.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.control.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          gh secret set PI_CHATGPT_ACCESS_TOKEN \
+            --repo "$ORG/$TARGET_REPOSITORY" \
+            < "$RUNNER_TEMP/pi-chatgpt-token"
+
+      - name: Emit execution handoff
+        if: steps.request.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.control.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          comment="$(
+            gh api \
+              "repos/$ORG/$TARGET_REPOSITORY/issues/comments/$COMMENT_ID"
+          )"
+
+          author="$(jq -r '.user.login' <<<"$comment")"
+          url="$(jq -r '.html_url' <<<"$comment")"
+          body="$(jq -r '.body // ""' <<<"$comment")"
+
+          marker="<!-- nyonya-pi:authorization:$COMMENT_ID -->"
+
+          quoted="$(
+            printf '%s\n' "$body" |
+              sed 's/^/> /'
+          )"
+
+          handoff="$(
+            printf '%s\n@nyonya-pi\n\nAuthorized by @%s: %s\n\n%s\n' \
+              "$marker" \
+              "$author" \
+              "$url" \
+              "$quoted"
+          )"
+
+          gh api \
+            --method POST \
+            "repos/$ORG/$TARGET_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
+            -f body="$handoff"
+
+      - name: Remove local credentials
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "$PI_CODING_AGENT_DIR"
+          rm -f "$RUNNER_TEMP/pi-chatgpt-token"
